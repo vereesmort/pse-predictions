@@ -25,7 +25,8 @@ warnings.filterwarnings("ignore")
 
 try:
     from rdkit import Chem
-    from rdkit.Chem import AllChem, Descriptors, rdMolDescriptors
+    from rdkit.Chem import Descriptors, rdMolDescriptors
+    from rdkit.Chem.rdFingerprintGenerator import GetMorganGenerator
     RDKIT_OK = True
 except ImportError:
     RDKIT_OK = False
@@ -158,8 +159,9 @@ class DrugFeatureBuilder:
             if mol is None:
                 continue
             # Morgan fingerprint
-            fp = AllChem.GetMorganFingerprintAsBitVect(
-                mol, self.morgan_radius, nBits=self.morgan_nbits)
+            gen = GetMorganGenerator(radius=self.morgan_radius,
+                                     fpSize=self.morgan_nbits)
+            fp = gen.GetFingerprint(mol)
             X[i, :self.morgan_nbits] = np.frombuffer(fp.ToBitString().encode(),
                                                       dtype=np.uint8) - ord('0')
             # Physicochemical descriptors (normalised by fixed scales)
