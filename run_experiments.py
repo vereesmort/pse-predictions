@@ -228,7 +228,6 @@ def main():
         all_res = pd.concat(all_result_frames, ignore_index=True)
         all_res.to_csv(os.path.join(METRICS_DIR, "all_results.csv"), index=False)
         print(f"  Saved all_results.csv ({len(all_res)} rows)")
-        agg.save_tables()
 
     # ── 7. Generate plots ──────────────────────────────────────────────────────
     print("\n[7/7] Generating plots...")
