@@ -236,7 +236,7 @@ class DrugFeatureBuilder:
                         return None
             return None
 
-        _SMILES_KEYS = ("CanonicalSMILES", "IsomericSMILES", "SMILES")
+        _SMILES_KEYS = ("CanonicalSMILES", "ConnectivitySMILES", "IsomericSMILES", "SMILES")
 
         def extract_smiles(prop):
             for key in _SMILES_KEYS:
