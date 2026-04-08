@@ -174,54 +174,199 @@ class DrugFeatureBuilder:
 
         return X, has_smiles
 
-    # ── Fetch SMILES from PubChem (fallback) ──────────────────────────────────
+    # ── Fetch SMILES from PubChem ─────────────────────────────────────────────
     @staticmethod
-    def fetch_smiles_pubchem(stitch_ids, cache_path="data/smiles_cache.csv"):
+    def fetch_smiles_pubchem(stitch_ids, cache_path="data/smiles_cache.csv",
+                             batch_size=100, sleep_batch=0.4, sleep_single=0.25,
+                             max_retries=3, retry_wait=5):
         """
         Convert STITCH CID → PubChem CID → canonical SMILES.
-        Caches results to avoid repeated HTTP calls.
+
+        - Batch requests: up to `batch_size` CIDs per call (far fewer HTTP requests)
+        - Correct STITCH parsing: skips flat/stereo indicator digit
+        - Exponential backoff retry on HTTP 429/503
+        - requests.Session with User-Agent (avoids Colab blocks)
+        - Incremental cache save after every batch (safe to interrupt/resume)
+        - Single-CID fallback for any batch failures
+        - Connectivity pre-check against aspirin (CID 2244)
 
         Returns dict {STITCH_id: SMILES or None}
         """
-        import os, urllib.request, json, time
+        import os, json, time
+        try:
+            import requests
+        except ImportError:
+            raise ImportError("pip install requests")
 
-        cache = {}
-        if os.path.exists(cache_path):
-            df = pd.read_csv(cache_path)
-            cache = dict(zip(df["STITCH"], df["SMILES"]))
-        results = {}
-        new_fetches = []
-        for sid in stitch_ids:
-            if sid in cache:
-                results[sid] = cache[sid] if pd.notna(cache[sid]) else None
-                continue
-            # STITCH CID format: "CID000XXXXXX" → PubChem CID = int(XXXXXX)
+        cache_dir = os.path.dirname(cache_path)
+        if cache_dir:
+            os.makedirs(cache_dir, exist_ok=True)
+
+        progress_path = cache_path.replace(".csv", "_progress.json")
+
+        # ── helpers ───────────────────────────────────────────────────────────
+        session = requests.Session()
+        session.headers.update({"User-Agent": "Mozilla/5.0"})
+
+        def stitch_to_cid(sid):
+            # STITCH format: CID + [0|1 flat/stereo] + 8-digit PubChem CID
+            # e.g. CID100020430 → skip indicator '1' → CID 20430
             try:
-                cid = int(sid.replace("CID", "").lstrip("0") or "0")
-                url = (f"https://pubchem.ncbi.nlm.nih.gov/rest/pug/compound/"
-                       f"cid/{cid}/property/CanonicalSMILES/JSON")
-                with urllib.request.urlopen(url, timeout=10) as r:
-                    data = json.loads(r.read())
-                smi = data["PropertyTable"]["Properties"][0]["CanonicalSMILES"]
-                results[sid] = smi
-                new_fetches.append({"STITCH": sid, "SMILES": smi})
-            except Exception:
-                results[sid] = None
-                new_fetches.append({"STITCH": sid, "SMILES": None})
-            time.sleep(0.1)  # polite rate limit
+                return int(sid.replace("CID", "")[1:])
+            except (ValueError, IndexError):
+                return 0
 
-        # Update cache
-        if new_fetches:
-            new_df = pd.DataFrame(new_fetches)
+        def make_request(url):
+            for attempt in range(max_retries + 1):
+                try:
+                    r = session.get(url, timeout=15)
+                    if r.status_code == 200:
+                        return r.content
+                    if r.status_code in (429, 503) and attempt < max_retries:
+                        wait = retry_wait * (2 ** attempt)
+                        print(f"    Rate limit (HTTP {r.status_code}) — "
+                              f"retrying in {wait}s...")
+                        time.sleep(wait)
+                    else:
+                        return None
+                except Exception:
+                    if attempt < max_retries:
+                        time.sleep(retry_wait)
+                    else:
+                        return None
+            return None
+
+        _SMILES_KEYS = ("CanonicalSMILES", "IsomericSMILES", "SMILES")
+
+        def extract_smiles(prop):
+            for key in _SMILES_KEYS:
+                if key in prop:
+                    return prop[key]
+            return None
+
+        def fetch_batch(cids):
+            url = ("https://pubchem.ncbi.nlm.nih.gov/rest/pug/compound/cid/"
+                   f"{','.join(str(c) for c in cids)}/property/CanonicalSMILES/JSON")
+            raw = make_request(url)
+            if not raw:
+                return {}
+            try:
+                props = json.loads(raw).get("PropertyTable", {}).get("Properties", [])
+                return {int(p["CID"]): s for p in props if (s := extract_smiles(p))}
+            except Exception:
+                return {}
+
+        def fetch_single(cid):
+            url = ("https://pubchem.ncbi.nlm.nih.gov/rest/pug/compound/cid/"
+                   f"{cid}/property/CanonicalSMILES/JSON")
+            raw = make_request(url)
+            if not raw:
+                return None
+            try:
+                props = json.loads(raw).get("PropertyTable", {}).get("Properties", [])
+                return extract_smiles(props[0]) if props else None
+            except Exception:
+                return None
+
+        def save_cache(smiles_dict):
+            rows = [{"STITCH": sid, "SMILES": smi}
+                    for sid, smi in smiles_dict.items()]
+            new_df = pd.DataFrame(rows)
             if os.path.exists(cache_path):
                 old_df = pd.read_csv(cache_path)
                 combined = pd.concat([old_df, new_df]).drop_duplicates("STITCH")
             else:
                 combined = new_df
-            os.makedirs(os.path.dirname(cache_path), exist_ok=True)
             combined.to_csv(cache_path, index=False)
 
-        return results
+        # ── load existing cache ────────────────────────────────────────────────
+        smiles = {}
+        if os.path.exists(progress_path):
+            with open(progress_path) as f:
+                smiles = json.load(f)
+            print(f"Resuming: {len(smiles)} already fetched.")
+        elif os.path.exists(cache_path):
+            df = pd.read_csv(cache_path)
+            smiles = {r["STITCH"]: r["SMILES"]
+                      for _, r in df.iterrows() if pd.notna(r["SMILES"])}
+            print(f"Loaded {len(smiles)} from existing cache.")
+
+        remaining = [sid for sid in stitch_ids if sid not in smiles]
+        print(f"Total: {len(stitch_ids)} | Already cached: {len(smiles)} | "
+              f"To fetch: {len(remaining)}")
+
+        if not remaining:
+            print("All drugs already cached — nothing to fetch.")
+            return {sid: smiles.get(sid) for sid in stitch_ids}
+
+        # ── connectivity check ────────────────────────────────────────────────
+        print("Testing PubChem connectivity (aspirin CID 2244)...")
+        test = fetch_single(2244)
+        if test:
+            print(f"  OK — {test[:60]}")
+        else:
+            print("  FAILED — PubChem not reachable from this environment.")
+            print("  Try: !curl -s 'https://pubchem.ncbi.nlm.nih.gov/rest/pug/"
+                  "compound/cid/2244/property/CanonicalSMILES/JSON'")
+            return {sid: smiles.get(sid) for sid in stitch_ids}
+
+        # ── batch fetch ───────────────────────────────────────────────────────
+        cid_to_stitch = {stitch_to_cid(sid): sid
+                         for sid in remaining if stitch_to_cid(sid) > 0}
+        valid_cids    = sorted(cid_to_stitch)
+        failed_cids   = []
+
+        print(f"\nFetching {len(valid_cids)} drugs in batches of {batch_size}...")
+        for i in range(0, len(valid_cids), batch_size):
+            batch        = valid_cids[i : i + batch_size]
+            batch_result = fetch_batch(batch)
+
+            for cid in batch:
+                stitch = cid_to_stitch[cid]
+                if cid in batch_result:
+                    smiles[stitch] = batch_result[cid]
+                else:
+                    failed_cids.append(cid)
+
+            done = min(i + batch_size, len(valid_cids))
+            print(f"  {done}/{len(valid_cids)}  "
+                  f"fetched={len(smiles)}  failed={len(failed_cids)}")
+
+            with open(progress_path, "w") as f:
+                json.dump(smiles, f)
+
+            time.sleep(sleep_batch)
+
+        # ── single-CID fallback ───────────────────────────────────────────────
+        if failed_cids:
+            print(f"\nFallback: retrying {len(failed_cids)} failed CIDs one by one...")
+            still_failed = []
+            for j, cid in enumerate(failed_cids):
+                stitch = cid_to_stitch[cid]
+                result = fetch_single(cid)
+                if result:
+                    smiles[stitch] = result
+                else:
+                    still_failed.append(stitch)
+                if (j + 1) % 20 == 0 or (j + 1) == len(failed_cids):
+                    print(f"  {j+1}/{len(failed_cids)}  "
+                          f"recovered={len(failed_cids)-len(still_failed)}")
+                time.sleep(sleep_single)
+
+            if still_failed:
+                print(f"  Could not fetch {len(still_failed)} drugs "
+                      f"(will be zero-vectors).")
+
+        # ── final save ────────────────────────────────────────────────────────
+        save_cache(smiles)
+        if os.path.exists(progress_path):
+            os.remove(progress_path)
+
+        n_ok = sum(1 for sid in stitch_ids if smiles.get(sid))
+        print(f"\nDone: {n_ok}/{len(stitch_ids)} drugs have SMILES "
+              f"({100*n_ok/max(len(stitch_ids),1):.1f}% coverage)")
+
+        return {sid: smiles.get(sid) for sid in stitch_ids}
 
     # ── Master build ──────────────────────────────────────────────────────────
     def build_all(self, drugs, smiles_dict=None, ppi_embedding_dim=64):
