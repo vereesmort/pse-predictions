@@ -183,14 +183,12 @@ class DrugFeatureBuilder:
 
         Returns dict {STITCH_id: SMILES or None}
         """
-        import urllib.request, json, time
+        import os, urllib.request, json, time
 
         cache = {}
         if os.path.exists(cache_path):
             df = pd.read_csv(cache_path)
             cache = dict(zip(df["STITCH"], df["SMILES"]))
-
-        import os
         results = {}
         new_fetches = []
         for sid in stitch_ids:
