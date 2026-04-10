@@ -282,10 +282,12 @@ def build_fingerprint_matrix(
             np.frombuffer(fp.ToBitString().encode(), dtype=np.uint8) - ord("0")
         )
         for j, (fn, scale) in enumerate(zip(physchem_fns, physchem_scales)):
-            try:
-                X[i, n_bits + j] = float(fn(mol)) / scale
-            except Exception:
-                pass
+                try:
+                    # Clip to 0: NMF requires non-negative input.
+                    # LogP in particular can be negative for hydrophilic drugs.
+                    X[i, n_bits + j] = max(0.0, float(fn(mol)) / scale)
+                except Exception:
+                    pass
         n_ok += 1
 
     n_miss = len(drugs) - n_ok
@@ -312,7 +314,9 @@ def fit_nmf_train_only(
     X_combined: np.ndarray,
     train_idx: np.ndarray,
     n_components: int,
-) -> np.ndarray:
+    n_train_samples: int,
+    min_ratio: float = 5.0,
+) -> tuple[np.ndarray, int]:
     """
     Fit NMF on training drug rows only, then transform all drugs.
 
@@ -321,19 +325,59 @@ def fit_nmf_train_only(
     val/test drugs. Unlike PCA, NMF components are non-negative and
     additive — each component is a co-activation 'biological program'.
 
-    Returns Z : (n_drugs, n_components) non-negative float32
+    Adaptive rank selection
+    -----------------------
+    The classifier receives hadamard_absdiff pair features of shape (n, 2k).
+    To keep the samples-to-features ratio ≥ min_ratio we cap k at:
+
+        k ≤ n_train_samples / (2 * min_ratio)
+
+    Three caps therefore apply (tightest wins):
+      1. User-specified --n-components (global ceiling)
+      2. n_train_drugs - 1  (NMF cannot have more components than samples)
+      3. n_train_samples / (2 * min_ratio)  (overfitting guard)
+
+    With min_ratio=5, viral encephalitis (n≈740) gets k≤74 instead of 113,
+    keeping the feature-to-sample ratio safe for LightGBM.
+
+    Parameters
+    ----------
+    X_combined      : (n_drugs, n_features) combined feature block
+    train_idx       : indices of training drugs in all_drugs
+    n_components    : maximum requested NMF rank (--n-components flag)
+    n_train_samples : number of training pairs (positives + negatives)
+    min_ratio       : minimum required n_train_samples / (2k) ratio
+
+    Returns
+    -------
+    Z        : (n_drugs, actual_k) non-negative float32 NMF embeddings
+    actual_k : effective rank used (may be < n_components)
     """
-    n_components = min(n_components, len(train_idx) - 1)
+    # Cap 1: user ceiling
+    k = n_components
+    # Cap 2: NMF cannot exceed number of training drug rows
+    k = min(k, len(train_idx) - 1)
+    # Cap 3: samples-to-features guard (pair features = 2k)
+    k_safe = max(1, int(n_train_samples / (2.0 * min_ratio)))
+    if k_safe < k:
+        print(f"    [adaptive k] {k} → {k_safe}  "
+              f"(n_train={n_train_samples}, ratio would be "
+              f"{n_train_samples / (2.0 * k):.1f} < {min_ratio:.0f})")
+        k = k_safe
+
     nmf = NMF(
-        n_components=n_components,
-        init="nndsvda",       # deterministic warm start, better than random
+        n_components=k,
+        init="nndsvda",   # deterministic SVD warm start, avoids random local minima
         max_iter=400,
         random_state=RANDOM_SEED,
         tol=1e-4,
     )
-    nmf.fit(X_combined[train_idx])
-    Z = nmf.transform(X_combined).astype(np.float32)
-    return Z, n_components
+    # NMF requires non-negative input; clip guards against any residual
+    # negative values (e.g. negative LogP after scale division).
+    X_nn = np.clip(X_combined, 0, None)
+    nmf.fit(X_nn[train_idx])
+    Z = nmf.transform(X_nn).astype(np.float32)
+    return Z, k
 
 
 # ── Main ──────────────────────────────────────────────────────────────────────
@@ -439,13 +483,26 @@ def run_netprop_nmf(
         if len(split.train) == 0 or split.train["label"].nunique() < 2:
             continue
 
-        # Indices of drugs present in training set
+        # Indices of unique drugs present in the training split
         train_drugs = set(split.train["drug_1"]).union(set(split.train["drug_2"]))
         train_idx   = np.array([d2i[d] for d in all_drugs if d in train_drugs])
+        n_train     = len(split.train)       # number of training (pair) samples
 
-        # NMF fitted on training drugs only — no leakage into val/test
-        Z, actual_k = fit_nmf_train_only(X_combined, train_idx, n_components)
+        # Warn early if the SE is tiny — ratio is computed inside fit_nmf_train_only
+        # but surface it here so it's visible in the per-SE progress line.
+        raw_ratio = n_train / (2.0 * min(n_components, len(train_idx) - 1))
+        if raw_ratio < 5.0:
+            print(f"    [WARNING] SE '{SE_NAMES.get(se_id, se_id)}': "
+                  f"n_train={n_train}, uncapped pair_feats={2*min(n_components, len(train_idx)-1)}, "
+                  f"ratio={raw_ratio:.1f} — k will be reduced to maintain ratio≥5")
+
+        # NMF fitted on training drugs only — no leakage into val/test.
+        # Adaptive k ensures n_train / (2k) ≥ 5 (controlled overfitting risk).
+        Z, actual_k = fit_nmf_train_only(
+            X_combined, train_idx, n_components, n_train_samples=n_train)
         drug2idx = {d: idx for idx, d in enumerate(all_drugs)}
+
+        actual_ratio = n_train / max(2 * actual_k, 1)
 
         def get_X(df: pd.DataFrame) -> np.ndarray:
             zi = Z[np.array([drug2idx[d] for d in df["drug_1"]])]
@@ -464,12 +521,16 @@ def run_netprop_nmf(
         else:
             n_pos = y_tr.sum()
             n_neg = len(y_tr) - n_pos
-            n_train = len(y_tr)
+            # num_leaves: fewer leaves for smaller training sets
             num_leaves = max(7, min(63, n_train // 50))
+            # min_child_samples: scale with training size; floor at 5, cap at 20.
+            # Prevents leaf splits on <5 samples when n_train is very small.
+            min_child = max(5, min(20, n_train // 30))
             params = {
                 **lgbm_params,
-                "num_leaves"       : num_leaves,
-                "scale_pos_weight" : n_neg / max(n_pos, 1),
+                "num_leaves"        : num_leaves,
+                "min_child_samples" : min_child,
+                "scale_pos_weight"  : n_neg / max(n_pos, 1),
             }
             dtrain  = lgb.Dataset(X_tr, label=y_tr)
             dval    = lgb.Dataset(X_vl, label=y_vl, reference=dtrain)
@@ -485,23 +546,27 @@ def run_netprop_nmf(
         model_label = f"netprop_nmf_{'mlp' if use_mlp else 'lgbm'}"
 
         results_rows.append({
-            "se_id"       : se_id,
-            "se_name"     : SE_NAMES.get(se_id, se_id),
-            "model"       : model_label,
-            "protocol"    : variant,
-            "split"       : split_label,
-            "neg"         : neg_label,
-            "operator"    : "hadamard_absdiff",
-            "features"    : f"{block_desc}_nmf{actual_k}d",
-            "alpha"       : alpha if not skip_prop else 0.0,
-            "n_components": actual_k,
+            "se_id"          : se_id,
+            "se_name"        : SE_NAMES.get(se_id, se_id),
+            "model"          : model_label,
+            "protocol"       : variant,
+            "split"          : split_label,
+            "neg"            : neg_label,
+            "operator"       : "hadamard_absdiff",
+            "features"       : f"{block_desc}_nmf{actual_k}d",
+            "alpha"          : alpha if not skip_prop else 0.0,
+            "n_components"   : actual_k,
+            "n_train"        : n_train,
+            "pair_feats"     : 2 * actual_k,
+            "sample_feat_ratio": round(actual_ratio, 2),
             **metrics,
         })
 
         if (i + 1) % 3 == 0 or i == 0:
+            ratio_flag = " (!)" if actual_ratio < 5 else ""
             print(f"  [{i+1:2d}/{len(se_ids)}] {SE_NAMES.get(se_id, se_id):35s} "
                   f"AUROC={metrics['auroc']:.4f}  AP={metrics['ap']:.4f}  "
-                  f"k={actual_k}")
+                  f"k={actual_k}  ratio={actual_ratio:.1f}{ratio_flag}")
 
     results = pd.DataFrame(results_rows)
     print(f"\n  Mean AUROC ({variant}): {results['auroc'].mean():.4f}")
