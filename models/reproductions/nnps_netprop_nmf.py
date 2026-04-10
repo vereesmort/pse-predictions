@@ -82,8 +82,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(__file__))))
 import numpy as np
 import pandas as pd
 from scipy.sparse import csr_matrix, diags
-from sklearn.decomposition import NMF, TruncatedSVD
-from scipy.sparse import csr_matrix as sparse_csr
+from sklearn.decomposition import NMF
 
 import lightgbm as lgb
 
@@ -381,37 +380,12 @@ def fit_nmf_train_only(
     return Z, k
 
 
-def fit_svd_fp_train_only(
-    X_fp: np.ndarray,
-    train_idx: np.ndarray,
-    n_components: int,
-) -> np.ndarray:
-    """
-    Reduce fingerprints with TruncatedSVD fitted on training drugs only.
-
-    Fingerprints are kept separate from the NMF bio block because they are
-    dense (all drugs have SMILES) whereas target/mono are sparse.  Mixing
-    them into the NMF reconstruction objective causes the loss to be
-    dominated by fingerprint reconstruction, drowning out the biological
-    signal from the target and mono blocks.
-
-    Returns
-    -------
-    Z_fp : (n_drugs, n_components) float32
-    """
-    k = min(n_components, len(train_idx) - 1)
-    svd = TruncatedSVD(n_components=k, random_state=RANDOM_SEED)
-    svd.fit(sparse_csr(X_fp[train_idx]))
-    return svd.transform(sparse_csr(X_fp)).astype(np.float32)
-
-
 # ── Main ──────────────────────────────────────────────────────────────────────
 
 def run_netprop_nmf(
     se_ids=None,
     alpha: float = 0.85,
     n_components: int = 128,
-    n_fp_components: int = 64,
     skip_prop: bool = False,
     use_fp: bool = True,
     random_split: bool = False,
@@ -419,7 +393,7 @@ def run_netprop_nmf(
     use_mlp: bool = False,
 ):
     prop_label  = "no_prop" if skip_prop else f"rwr_a{alpha:.2f}"
-    fp_label    = f"fp{n_fp_components}" if use_fp else "nofp"
+    fp_label    = "fp" if use_fp else "nofp"
     split_label = "random_pair" if random_split else "drug_cold_start"
     neg_label   = "random" if random_neg else "structured"
     clf_label   = "mlp" if use_mlp else "lgbm"
@@ -428,11 +402,8 @@ def run_netprop_nmf(
     print("\n" + "=" * 65)
     print("NNPS — Network Propagation + NMF Features (fair protocol)")
     print(f"  Propagation  : {'DISABLED (raw binary)' if skip_prop else f'RWR alpha={alpha}'}")
-    if use_fp:
-        print(f"  Fingerprints : ECFP4+physchem → TruncSVD({n_fp_components}d) [bypass NMF]")
-    else:
-        print(f"  Fingerprints : NO (--no-fp)")
-    print(f"  Bio reduction: NMF (k={n_components}) on target+mono only")
+    print(f"  Fingerprints : {'YES (ECFP4 + physchem, fed into NMF)' if use_fp else 'NO (--no-fp)'}")
+    print(f"  Reduction    : NMF (k={n_components}) on target+mono+fp")
     print(f"  Split        : {split_label}")
     print(f"  Negatives    : {neg_label}")
     print(f"  Classifier   : {'MLP (300→200→100)' if use_mlp else 'LightGBM'}")
@@ -462,25 +433,30 @@ def run_netprop_nmf(
               f"(mean={X_propagated.mean():.5f}, max={X_propagated.max():.4f})")
 
     # ── Step 3: Morgan fingerprints ───────────────────────────────────────────
-    # Fingerprints are built here but kept SEPARATE from the NMF bio block.
-    # Mixing them into NMF causes the loss to be dominated by fingerprint
-    # reconstruction (dense, all 645 drugs) and drowns out the sparse
-    # biological signals from target/mono.  Instead they bypass NMF and are
-    # reduced per-SE with TruncatedSVD (fitted on training drugs only).
+    # Drugs with no protein targets have all-zero rows in X_propagated.
+    # Fingerprints provide non-zero signal for those drugs via chemical
+    # structure alone, covering ~53% of drugs and ~24% of pairs.
     if use_fp:
         smiles_cache = os.path.join(CACHE_DIR, "smiles.csv")
         X_fp, _ = build_fingerprint_matrix(all_drugs, smiles_cache)
     else:
         X_fp = None
 
-    # ── Step 4: normalise bio blocks and build NMF input ─────────────────────
-    # Only target+mono go into NMF.  Max-normalise to [0, 1] so that the
-    # small RWR float values match the binary {0,1} mono block in scale.
-    X_bio = np.concatenate([
+    # ── Step 4: normalise and concatenate all blocks ──────────────────────────
+    # Max-normalise each block to [0, 1] so that the RWR propagated values
+    # (small floats) are on the same scale as the binary {0,1} blocks.
+    # Binary matrices are unchanged by this operation (their max = 1).
+    blocks = [
         max_normalise(X_propagated, "propagated_target"),
         max_normalise(X_mono,       "mono_se"),
-    ], axis=1)
-    print(f"  Bio matrix (NMF input): {X_bio.shape}  (rwr_target+mono)")
+    ]
+    block_desc = "rwr_target+mono"
+    if X_fp is not None:
+        blocks.append(max_normalise(X_fp, "fingerprints"))
+        block_desc += "+fp"
+
+    X_combined = np.concatenate(blocks, axis=1)
+    print(f"  Combined matrix : {X_combined.shape}  (blocks: {block_desc})")
 
     # ── Step 5: negatives & splits ────────────────────────────────────────────
     negatives = build_negatives(combo_f, neg_label, se_ids)
@@ -511,37 +487,21 @@ def run_netprop_nmf(
         train_idx   = np.array([d2i[d] for d in all_drugs if d in train_drugs])
         n_train     = len(split.train)       # number of training (pair) samples
 
-        # Early ratio warning (total drug feats = NMF k + fp SVD k).
-        # Exact k is capped inside fit_nmf_train_only; use uncapped here just
-        # for the warning so tiny-SE cases are visible before the slow NMF fit.
-        uncapped_k = min(n_components, len(train_idx) - 1)
-        uncapped_fp = min(n_fp_components, len(train_idx) - 1) if X_fp is not None else 0
-        raw_ratio = n_train / (2.0 * (uncapped_k + uncapped_fp))
+        # Warn early if the SE is tiny — ratio is computed inside fit_nmf_train_only
+        # but surface it here so it's visible in the per-SE progress line.
+        raw_ratio = n_train / (2.0 * min(n_components, len(train_idx) - 1))
         if raw_ratio < 5.0:
             print(f"    [WARNING] SE '{SE_NAMES.get(se_id, se_id)}': "
-                  f"n_train={n_train}, uncapped pair_feats={2*(uncapped_k+uncapped_fp)}, "
+                  f"n_train={n_train}, uncapped pair_feats={2*min(n_components, len(train_idx)-1)}, "
                   f"ratio={raw_ratio:.1f} — k will be reduced to maintain ratio≥5")
 
-        # NMF on bio features only (target+mono) — no leakage into val/test.
-        # Adaptive k ensures n_train / (2 * total_pair_feats) ≥ 5.
-        Z_bio, actual_k = fit_nmf_train_only(
-            X_bio, train_idx, n_components, n_train_samples=n_train)
-
-        # Fingerprint bypass: TruncatedSVD fitted on training drugs only.
-        # Kept separate so NMF focuses purely on the biological signal.
-        if X_fp is not None:
-            k_fp = min(n_fp_components, len(train_idx) - 1)
-            Z_fp = fit_svd_fp_train_only(X_fp, train_idx, k_fp)
-            Z = np.concatenate([Z_bio, Z_fp], axis=1)
-            feat_desc = f"bio_nmf{actual_k}+fp_svd{k_fp}"
-        else:
-            Z = Z_bio
-            feat_desc = f"bio_nmf{actual_k}"
-
+        # NMF fitted on training drugs only — no leakage into val/test.
+        # Adaptive k ensures n_train / (2k) ≥ 5 (controlled overfitting risk).
+        Z, actual_k = fit_nmf_train_only(
+            X_combined, train_idx, n_components, n_train_samples=n_train)
         drug2idx = {d: idx for idx, d in enumerate(all_drugs)}
 
-        total_drug_feats = Z.shape[1]
-        actual_ratio = n_train / max(2 * total_drug_feats, 1)
+        actual_ratio = n_train / max(2 * actual_k, 1)
 
         def get_X(df: pd.DataFrame) -> np.ndarray:
             zi = Z[np.array([drug2idx[d] for d in df["drug_1"]])]
@@ -592,11 +552,11 @@ def run_netprop_nmf(
             "split"          : split_label,
             "neg"            : neg_label,
             "operator"       : "hadamard_absdiff",
-            "features"       : feat_desc,
+            "features"       : f"{block_desc}_nmf{actual_k}d",
             "alpha"          : alpha if not skip_prop else 0.0,
             "n_components"   : actual_k,
             "n_train"        : n_train,
-            "pair_feats"     : 2 * total_drug_feats,
+            "pair_feats"     : 2 * actual_k,
             "sample_feat_ratio": round(actual_ratio, 2),
             **metrics,
         })
@@ -605,7 +565,7 @@ def run_netprop_nmf(
             ratio_flag = " (!)" if actual_ratio < 5 else ""
             print(f"  [{i+1:2d}/{len(se_ids)}] {SE_NAMES.get(se_id, se_id):35s} "
                   f"AUROC={metrics['auroc']:.4f}  AP={metrics['ap']:.4f}  "
-                  f"feats={feat_desc}  ratio={actual_ratio:.1f}{ratio_flag}")
+                  f"k={actual_k}  ratio={actual_ratio:.1f}{ratio_flag}")
 
     results = pd.DataFrame(results_rows)
     print(f"\n  Mean AUROC ({variant}): {results['auroc'].mean():.4f}")
@@ -625,9 +585,7 @@ if __name__ == "__main__":
     parser.add_argument("--alpha", type=float, default=0.85,
                         help="RWR restart probability (default: 0.85)")
     parser.add_argument("--n-components", type=int, default=128,
-                        help="NMF rank for bio block / number of latent biological modules (default: 128)")
-    parser.add_argument("--fp-components", type=int, default=64,
-                        help="TruncatedSVD rank for fingerprint bypass block (default: 64)")
+                        help="NMF rank / number of latent biological modules (default: 128)")
     parser.add_argument("--skip-prop", action="store_true",
                         help="Skip PPI propagation; apply NMF to raw binary features")
     parser.add_argument("--no-fp", action="store_true",
@@ -645,7 +603,6 @@ if __name__ == "__main__":
         se_ids=se_ids,
         alpha=args.alpha,
         n_components=args.n_components,
-        n_fp_components=args.fp_components,
         skip_prop=args.skip_prop,
         use_fp=not args.no_fp,
         random_split=args.random_split,
