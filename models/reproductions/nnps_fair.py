@@ -15,6 +15,7 @@ Every fix is individually toggleable to isolate contributions:
   --random-split     : use random pair split instead of cold-start
   --random-neg       : use random instead of structured negatives
   --sum-operator     : use sum instead of hadamard_absdiff
+  --use-mlp          : use MLP (300→200→100) instead of LightGBM
 
 Usage
 -----
@@ -22,6 +23,7 @@ Usage
     python models/reproductions/nnps_fair.py --ses all
     python models/reproductions/nnps_fair.py --pca-leakage   # isolate fix 1
     python models/reproductions/nnps_fair.py --random-split  # isolate fix 2
+    python models/reproductions/nnps_fair.py --use-mlp       # paper architecture
 """
 
 import os, sys, argparse
@@ -42,6 +44,7 @@ from evaluation.metrics import compute_metrics
 from configs.config import METRICS_DIR, CACHE_DIR, RANDOM_SEED
 
 import lightgbm as lgb
+from models.reproductions.nnps_original import NNPSMlp, train_mlp_per_se
 
 
 # ── Fair feature construction ─────────────────────────────────────────────────
@@ -130,16 +133,19 @@ class NNPSFairFeatureSet:
 # ── Main ──────────────────────────────────────────────────────────────────────
 
 def run_nnps_fair(se_ids=None, pca_leakage=False, random_split=False,
-                  random_neg=False, sum_operator=False):
+                  random_neg=False, sum_operator=False, use_mlp=False):
 
     label = "fair" + ("_pcaleak" if pca_leakage else "") + \
             ("_randsplit" if random_split else "") + \
             ("_randneg" if random_neg else "") + \
-            ("_sum" if sum_operator else "")
+            ("_sum" if sum_operator else "") + \
+            ("_mlp" if use_mlp else "")
 
+    classifier = "MLP (300→200→100)" if use_mlp else "LightGBM"
     print("\n" + "="*65)
     print(f"NNPS FAIR PROTOCOL — variant: {label}")
     print("Fixes: no PCA leakage | cold-start split | structured neg | hadamard_absdiff")
+    print(f"Classifier: {classifier}")
     print("="*65 + "\n")
 
     combo_f, mono, ppi, targets, all_drugs, se_ids = load_decagon_data(se_ids)
@@ -172,7 +178,8 @@ def run_nnps_fair(se_ids=None, pca_leakage=False, random_split=False,
         "verbose": -1,
     }
 
-    print(f"\nTraining per-SE LightGBM ({len(se_ids)} SEs)...")
+    classifier = "MLP (300→200→100)" if use_mlp else "LightGBM"
+    print(f"\nTraining per-SE {classifier} ({len(se_ids)} SEs)...")
     for i, se_id in enumerate(se_ids):
         split = splits[se_id]
         if len(split.train) == 0 or split.train["label"].nunique() < 2:
@@ -206,26 +213,34 @@ def run_nnps_fair(se_ids=None, pca_leakage=False, random_split=False,
         X_vl = get_X(split.val);   y_vl = split.val["label"].values
         X_te = get_X(split.test);  y_te = split.test["label"].values
 
-        n_pos = y_tr.sum(); n_neg = len(y_tr) - n_pos
-        params = {**lgbm_params,
-                  "num_leaves": num_leaves,
-                  "scale_pos_weight": n_neg / max(n_pos, 1)}
+        if use_mlp:
+            input_dim = X_tr.shape[1]
+            proba = train_mlp_per_se(
+                X_tr, y_tr, X_vl, y_vl, X_te, y_te,
+                input_dim=input_dim,
+            )
+        else:
+            n_pos = y_tr.sum(); n_neg = len(y_tr) - n_pos
+            params = {**lgbm_params,
+                      "num_leaves": num_leaves,
+                      "scale_pos_weight": n_neg / max(n_pos, 1)}
+            dtrain = lgb.Dataset(X_tr, label=y_tr)
+            dval   = lgb.Dataset(X_vl, label=y_vl, reference=dtrain)
+            booster = lgb.train(
+                params, dtrain, num_boost_round=1000,
+                valid_sets=[dval],
+                callbacks=[lgb.early_stopping(50, verbose=False),
+                           lgb.log_evaluation(period=-1)],
+            )
+            proba = booster.predict(X_te)
 
-        dtrain = lgb.Dataset(X_tr, label=y_tr)
-        dval   = lgb.Dataset(X_vl, label=y_vl, reference=dtrain)
-        booster = lgb.train(
-            params, dtrain, num_boost_round=1000,
-            valid_sets=[dval],
-            callbacks=[lgb.early_stopping(50, verbose=False),
-                       lgb.log_evaluation(period=-1)],
-        )
-        proba   = booster.predict(X_te)
         metrics = compute_metrics(y_te, proba)
+        model_label = "nnps_mlp" if use_mlp else "nnps_lgbm"
 
         results_rows.append({
             "se_id"   : se_id,
             "se_name" : SE_NAMES.get(se_id, se_id),
-            "model"   : "nnps_lgbm",
+            "model"   : model_label,
             "protocol": label,
             "split"   : split_strategy,
             "neg"     : neg_strategy,
@@ -236,8 +251,9 @@ def run_nnps_fair(se_ids=None, pca_leakage=False, random_split=False,
         })
 
         if (i + 1) % 3 == 0 or i == 0:
+            extra = f"leaves={num_leaves}" if not use_mlp else f"dim={X_tr.shape[1]}"
             print(f"  [{i+1:2d}/{len(se_ids)}] {SE_NAMES.get(se_id, se_id):35s} "
-                  f"AUROC={metrics['auroc']:.4f}  leaves={num_leaves}")
+                  f"AUROC={metrics['auroc']:.4f}  {extra}")
 
     results = pd.DataFrame(results_rows)
     print(f"\n  Mean AUROC ({label}): {results['auroc'].mean():.4f}")
@@ -254,6 +270,8 @@ if __name__ == "__main__":
     parser.add_argument("--random-split",  action="store_true")
     parser.add_argument("--random-neg",    action="store_true")
     parser.add_argument("--sum-operator",  action="store_true")
+    parser.add_argument("--use-mlp",       action="store_true",
+                        help="Use MLP (300→200→100) instead of LightGBM")
     parser.add_argument("--run-both",      action="store_true",
                         help="Run original + fair and compare")
     args = parser.parse_args()
@@ -262,9 +280,9 @@ if __name__ == "__main__":
 
     if args.run_both:
         from models.reproductions.nnps_original import run_nnps_original
-        r_orig = run_nnps_original(se_ids=se_ids)
+        r_orig = run_nnps_original(se_ids=se_ids, use_lgbm=not args.use_mlp)
         r_orig["protocol"] = "original (inflated)"
-        r_fair = run_nnps_fair(se_ids=se_ids)
+        r_fair = run_nnps_fair(se_ids=se_ids, use_mlp=args.use_mlp)
         r_fair["protocol"] = "fair"
         combined = pd.concat([r_orig, r_fair], ignore_index=True)
         compare_protocols(combined, "NNPS")
@@ -276,4 +294,5 @@ if __name__ == "__main__":
             random_split=args.random_split,
             random_neg=args.random_neg,
             sum_operator=args.sum_operator,
+            use_mlp=args.use_mlp,
         )
