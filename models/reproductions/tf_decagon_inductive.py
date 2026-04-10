@@ -47,6 +47,13 @@ def build_drug_feature_matrix(fset, all_drugs, feature_mode="target+fp"):
     return fset.get(all_drugs, mode=feature_mode).astype(np.float32)
 
 
+def _get_entity_weights(model):
+    """Return entity embedding matrix (numpy) regardless of model type."""
+    if hasattr(model, "E2"):   # SimplE
+        return model.E1.weight.detach().cpu().numpy()
+    return model.E.weight.detach().cpu().numpy()   # DistMult
+
+
 def learn_cold_start_mapping(model, drug_feats, train_drug_indices):
     """
     Learn a linear mapping: drug_features → entity_embedding
@@ -54,11 +61,8 @@ def learn_cold_start_mapping(model, drug_feats, train_drug_indices):
 
     For SimplE we map to E1 (head embedding).
     """
-    if hasattr(model, "E2"):
-        E_train = model.E1[train_drug_indices]
-    else:
-        E_train = model.E[train_drug_indices]
-
+    E_all   = _get_entity_weights(model)
+    E_train = E_all[train_drug_indices]
     X_train = drug_feats[train_drug_indices]
     print(f"  Learning linear feature→embedding mapping: "
           f"{X_train.shape} → {E_train.shape}")
@@ -74,21 +78,16 @@ def predict_cold_start_embeddings(reg, drug_feats, all_drug_indices,
     For cold-start (held-out) drugs: use linear mapping.
     For training drugs: use learned embeddings directly.
     """
-    n_drugs = len(all_drug_indices)
-    dim = model.E1.shape[1] if hasattr(model, "E2") else model.E.shape[1]
-    E_pred = np.zeros((n_drugs, dim), dtype=np.float32)
-
+    n_drugs  = len(all_drug_indices)
+    E_all    = _get_entity_weights(model)
     train_set = set(train_drug_indices.tolist())
-    cold_mask  = np.array([i not in train_set for i in range(n_drugs)])
+    cold_mask = np.array([i not in train_set for i in range(n_drugs)])
 
-    # Mapping-predicted embeddings for all (will override train below)
+    # Start from regression-predicted embeddings for everyone
     E_pred = reg.predict(drug_feats).astype(np.float32)
 
     # Override with learned embeddings for training drugs
-    if hasattr(model, "E2"):
-        E_pred[train_drug_indices] = model.E1[train_drug_indices]
-    else:
-        E_pred[train_drug_indices] = model.E[train_drug_indices]
+    E_pred[train_drug_indices] = E_all[train_drug_indices]
 
     n_cold = cold_mask.sum()
     print(f"  Cold-start drugs (embedding from linear map): {n_cold} / {n_drugs}")
@@ -162,15 +161,19 @@ def run_tf_decagon_inductive(se_ids=None, model_name="distmult",
     E_inductive = predict_cold_start_embeddings(
         cs_map, drug_feats, list(range(len(all_drugs))), model, train_d_idx)
 
-    # Get relation embeddings
-    R_mat = model.R1 if hasattr(model, "R2") else model.R
+    # Get relation embedding matrices as numpy
+    if hasattr(model, "R2"):   # SimplE
+        R1_np = model.R1.weight.detach().cpu().numpy()
+        R2_np = model.R2.weight.detach().cpu().numpy()
+    else:                      # DistMult
+        R_np = model.R.weight.detach().cpu().numpy()
 
     def score_inductive(h_idx, r_idx, t_idx):
         if hasattr(model, "R2"):
-            s1 = (E_inductive[h_idx] * model.R1[r_idx] * E_inductive[t_idx]).sum(axis=-1)
-            s2 = (E_inductive[h_idx] * model.R2[r_idx] * E_inductive[t_idx]).sum(axis=-1)
+            s1 = (E_inductive[h_idx] * R1_np[r_idx] * E_inductive[t_idx]).sum(axis=-1)
+            s2 = (E_inductive[h_idx] * R2_np[r_idx] * E_inductive[t_idx]).sum(axis=-1)
             return 0.5 * (s1 + s2)
-        return (E_inductive[h_idx] * R_mat[r_idx] * E_inductive[t_idx]).sum(axis=-1)
+        return (E_inductive[h_idx] * R_np[r_idx] * E_inductive[t_idx]).sum(axis=-1)
 
     # Evaluate per SE on test pairs from cold-start splits
     print("\nEvaluating per SE (cold-start test set)...")

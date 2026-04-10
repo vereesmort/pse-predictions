@@ -31,89 +31,68 @@ import numpy as np
 import pandas as pd
 from scipy.special import expit  # sigmoid
 
+import torch
+import torch.nn as nn
+
 from models.reproductions._utils import (
     load_decagon_data, save_results, compare_protocols, SE_NAMES,
 )
 from evaluation.metrics import compute_metrics
 from configs.config import METRICS_DIR, RANDOM_SEED
 
+DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-# ── Tensor factorisation models ────────────────────────────────────────────────
 
-class DistMult:
+# ── Tensor factorisation models (PyTorch) ─────────────────────────────────────
+
+class DistMult(nn.Module):
     """
     DistMult: score(h, r, t) = <e_h, w_r, e_t>  (element-wise product then sum)
     Symmetric — same score for (h,r,t) and (t,r,h).
     """
     name = "distmult"
 
-    def __init__(self, n_entities, n_relations, dim=128, lr=0.001, seed=RANDOM_SEED):
-        rng = np.random.default_rng(seed)
-        scale = 1.0 / np.sqrt(dim)
-        self.E = rng.normal(0, scale, (n_entities,  dim)).astype(np.float32)
-        self.R = rng.normal(0, scale, (n_relations, dim)).astype(np.float32)
-        self.lr = lr
+    def __init__(self, n_entities, n_relations, dim=128, seed=RANDOM_SEED):
+        super().__init__()
+        torch.manual_seed(seed)
+        scale = 1.0 / (dim ** 0.5)
+        self.E = nn.Embedding(n_entities,  dim)
+        self.R = nn.Embedding(n_relations, dim)
+        nn.init.uniform_(self.E.weight, -scale, scale)
+        nn.init.uniform_(self.R.weight, -scale, scale)
 
     def score(self, h_idx, r_idx, t_idx):
-        return (self.E[h_idx] * self.R[r_idx] * self.E[t_idx]).sum(axis=-1)
+        return (self.E(h_idx) * self.R(r_idx) * self.E(t_idx)).sum(dim=-1)
 
-    def update(self, h_idx, r_idx, t_idx, labels, reg=1e-3):
-        s     = self.score(h_idx, r_idx, t_idx)
-        p     = expit(s)
-        delta = (p - labels) / len(labels)
-
-        dE_h = delta[:, None] * (self.R[r_idx] * self.E[t_idx])
-        dE_t = delta[:, None] * (self.R[r_idx] * self.E[h_idx])
-        dR_r = delta[:, None] * (self.E[h_idx] * self.E[t_idx])
-
-        np.add.at(self.E, h_idx, -self.lr * (dE_h + reg * self.E[h_idx]))
-        np.add.at(self.E, t_idx, -self.lr * (dE_t + reg * self.E[t_idx]))
-        np.add.at(self.R, r_idx, -self.lr * (dR_r + reg * self.R[r_idx]))
-        return float(np.mean(-(labels * np.log(p + 1e-9) +
-                               (1 - labels) * np.log(1 - p + 1e-9))))
+    def n_entities(self):
+        return self.E.weight.shape[0]
 
 
-class SimplE:
+class SimplE(nn.Module):
     """
     SimplE: score(h,r,t) = 0.5 * (<e_h, w_r, e'_t> + <e'_h, w'_r, e_t>)
     Fully expressive; handles asymmetric relations.
     """
     name = "simple"
 
-    def __init__(self, n_entities, n_relations, dim=128, lr=0.001, seed=RANDOM_SEED):
-        rng = np.random.default_rng(seed)
-        scale = 1.0 / np.sqrt(dim)
-        self.E1 = rng.normal(0, scale, (n_entities,  dim)).astype(np.float32)
-        self.E2 = rng.normal(0, scale, (n_entities,  dim)).astype(np.float32)
-        self.R1 = rng.normal(0, scale, (n_relations, dim)).astype(np.float32)
-        self.R2 = rng.normal(0, scale, (n_relations, dim)).astype(np.float32)
-        self.lr = lr
+    def __init__(self, n_entities, n_relations, dim=128, seed=RANDOM_SEED):
+        super().__init__()
+        torch.manual_seed(seed)
+        scale = 1.0 / (dim ** 0.5)
+        self.E1 = nn.Embedding(n_entities,  dim)
+        self.E2 = nn.Embedding(n_entities,  dim)
+        self.R1 = nn.Embedding(n_relations, dim)
+        self.R2 = nn.Embedding(n_relations, dim)
+        for emb in (self.E1, self.E2, self.R1, self.R2):
+            nn.init.uniform_(emb.weight, -scale, scale)
 
     def score(self, h_idx, r_idx, t_idx):
-        s1 = (self.E1[h_idx] * self.R1[r_idx] * self.E2[t_idx]).sum(axis=-1)
-        s2 = (self.E2[h_idx] * self.R2[r_idx] * self.E1[t_idx]).sum(axis=-1)
+        s1 = (self.E1(h_idx) * self.R1(r_idx) * self.E2(t_idx)).sum(dim=-1)
+        s2 = (self.E2(h_idx) * self.R2(r_idx) * self.E1(t_idx)).sum(dim=-1)
         return 0.5 * (s1 + s2)
 
-    def update(self, h_idx, r_idx, t_idx, labels, reg=1e-3):
-        s = self.score(h_idx, r_idx, t_idx)
-        p = expit(s)
-        d = (p - labels) / len(labels)
-
-        g1h = d[:,None] * self.R1[r_idx] * self.E2[t_idx] * 0.5
-        g2t = d[:,None] * self.R1[r_idx] * self.E1[h_idx] * 0.5
-        gR1 = d[:,None] * self.E1[h_idx] * self.E2[t_idx] * 0.5
-        g2h = d[:,None] * self.R2[r_idx] * self.E1[t_idx] * 0.5
-        g1t = d[:,None] * self.R2[r_idx] * self.E2[h_idx] * 0.5
-        gR2 = d[:,None] * self.E2[h_idx] * self.E1[t_idx] * 0.5
-
-        np.add.at(self.E1, h_idx, -self.lr * (g1h + g2h + reg * self.E1[h_idx]))
-        np.add.at(self.E1, t_idx, -self.lr * (g1t + reg * self.E1[t_idx]))
-        np.add.at(self.E2, t_idx, -self.lr * (g2t + reg * self.E2[t_idx]))
-        np.add.at(self.E2, h_idx, -self.lr * (g2h + reg * self.E2[h_idx]))
-        np.add.at(self.R1, r_idx, -self.lr * (gR1 + reg * self.R1[r_idx]))
-        np.add.at(self.R2, r_idx, -self.lr * (gR2 + reg * self.R2[r_idx]))
-        return float(np.mean(-(labels * np.log(p + 1e-9) +
-                               (1 - labels) * np.log(1 - p + 1e-9))))
+    def n_entities(self):
+        return self.E1.weight.shape[0]
 
 
 # ── Build entity/relation index ───────────────────────────────────────────────
@@ -122,36 +101,35 @@ def build_triple_index(combo_f, mono, drugs, ses, add_self_loops=True):
     """
     Build integer triple arrays (h, r, t) for all positive edges.
 
-    Polypharmacy edges:  (drug_i, se_r, drug_j)
+    Polypharmacy edges:   (drug_i, se_r, drug_j)
     Mono self-loop edges: (drug_i, mono_se_r, drug_i)  [TF-Decagon 'Self-loops']
+
+    Fully vectorised — no iterrows().
     """
     d2i = {d: i for i, d in enumerate(drugs)}
     s2i = {s: i for i, s in enumerate(ses)}   # polypharmacy SEs
 
-    # Polypharmacy triples
-    h = np.array([d2i[r["STITCH 1"]] for _, r in combo_f.iterrows()
-                  if r["STITCH 1"] in d2i and r["STITCH 2"] in d2i and
-                  r["Polypharmacy Side Effect"] in s2i], dtype=np.int32)
-    r = np.array([s2i[r["Polypharmacy Side Effect"]] for _, r in combo_f.iterrows()
-                  if r["STITCH 1"] in d2i and r["STITCH 2"] in d2i and
-                  r["Polypharmacy Side Effect"] in s2i], dtype=np.int32)
-    t = np.array([d2i[r["STITCH 2"]] for _, r in combo_f.iterrows()
-                  if r["STITCH 1"] in d2i and r["STITCH 2"] in d2i and
-                  r["Polypharmacy Side Effect"] in s2i], dtype=np.int32)
+    # Vectorised polypharmacy triples
+    cf = combo_f[
+        combo_f["STITCH 1"].isin(d2i) &
+        combo_f["STITCH 2"].isin(d2i) &
+        combo_f["Polypharmacy Side Effect"].isin(s2i)
+    ].copy()
+    h = cf["STITCH 1"].map(d2i).values.astype(np.int32)
+    r = cf["Polypharmacy Side Effect"].map(s2i).values.astype(np.int32)
+    t = cf["STITCH 2"].map(d2i).values.astype(np.int32)
 
     n_poly_relations = len(ses)
 
-    # Mono self-loop triples (TF-Decagon contribution)
+    # Mono self-loop triples (TF-Decagon contribution) — also vectorised
     if add_self_loops:
         mono_ses = sorted(mono["Individual Side Effect"].unique())
         ms2i     = {s: i + n_poly_relations for i, s in enumerate(mono_ses)}
-        drug2mono = mono.groupby("STITCH")["Individual Side Effect"].apply(list).to_dict()
-        sl_h, sl_r, sl_t = [], [], []
-        for drug in drugs:
-            di = d2i[drug]
-            for se in drug2mono.get(drug, []):
-                if se in ms2i:
-                    sl_h.append(di); sl_r.append(ms2i[se]); sl_t.append(di)
+        mono_f   = mono[mono["STITCH"].isin(d2i) &
+                        mono["Individual Side Effect"].isin(ms2i)].copy()
+        sl_h = mono_f["STITCH"].map(d2i).values.astype(np.int32)
+        sl_r = mono_f["Individual Side Effect"].map(ms2i).values.astype(np.int32)
+        sl_t = sl_h.copy()  # self-loops
         h = np.concatenate([h, sl_h])
         r = np.concatenate([r, sl_r])
         t = np.concatenate([t, sl_t])
@@ -164,57 +142,77 @@ def build_triple_index(combo_f, mono, drugs, ses, add_self_loops=True):
 
 # ── Training loop ─────────────────────────────────────────────────────────────
 
+def _t(arr, device):
+    """Convert int32 numpy array to a LongTensor on device."""
+    return torch.from_numpy(arr.astype(np.int64)).to(device)
+
+
 def train_tf_model(model, h_train, r_train, t_train,
                    h_val, r_val, t_val, y_val,
                    epochs=50, batch_size=1024, seed=RANDOM_SEED):
+    """
+    Train a DistMult / SimplE model with PyTorch autograd + Adam.
+    Replaces the previous per-sample np.add.at scatter which was
+    orders-of-magnitude slower on 4M+ triples.
+    """
+    model = model.to(DEVICE)
+    optimizer = torch.optim.Adam(model.parameters(), lr=1e-3, weight_decay=1e-3)
+    criterion = nn.BCEWithLogitsLoss()
+
     rng = np.random.default_rng(seed)
-    best_loss = np.inf
-    best_state = None
+    n_ents = model.n_entities()
+    best_auroc  = -np.inf
+    best_state  = None
+
+    h_val_t = _t(h_val, DEVICE)
+    r_val_t = _t(r_val, DEVICE)
+    t_val_t = _t(t_val, DEVICE)
 
     for epoch in range(epochs):
-        # Shuffle
+        model.train()
         idx = rng.permutation(len(h_train))
-        h_tr, r_tr, t_tr = h_train[idx], r_train[idx], t_train[idx]
+        h_tr = h_train[idx]; r_tr = r_train[idx]; t_tr = t_train[idx]
 
-        # Mini-batch with 1:1 negatives (1-vs-All approximation)
         epoch_loss = 0.0
         n_batches  = 0
         for start in range(0, len(h_tr), batch_size):
-            h_b = h_tr[start:start+batch_size]
-            r_b = r_tr[start:start+batch_size]
-            t_b = t_tr[start:start+batch_size]
-            # Negatives: replace tail with random entity
-            t_neg = rng.integers(0, model.E.shape[0], len(h_b)).astype(np.int32)
-            h_all = np.concatenate([h_b, h_b])
-            r_all = np.concatenate([r_b, r_b])
-            t_all = np.concatenate([t_b, t_neg])
-            y_all = np.concatenate([np.ones(len(h_b)), np.zeros(len(h_b))])
-            loss  = model.update(h_all, r_all, t_all, y_all)
-            epoch_loss += loss
+            h_b = h_tr[start:start + batch_size]
+            r_b = r_tr[start:start + batch_size]
+            t_b = t_tr[start:start + batch_size]
+            # 1:1 random-tail negatives
+            t_neg = rng.integers(0, n_ents, len(h_b)).astype(np.int32)
+
+            h_all = _t(np.concatenate([h_b, h_b]), DEVICE)
+            r_all = _t(np.concatenate([r_b, r_b]), DEVICE)
+            t_all = _t(np.concatenate([t_b, t_neg]), DEVICE)
+            y_all = torch.cat([torch.ones(len(h_b)), torch.zeros(len(h_b))]).to(DEVICE)
+
+            optimizer.zero_grad()
+            loss = criterion(model.score(h_all, r_all, t_all), y_all)
+            loss.backward()
+            optimizer.step()
+
+            epoch_loss += loss.item()
             n_batches  += 1
 
         # Validation
-        val_scores = model.score(h_val, r_val, t_val)
-        val_proba  = expit(val_scores)
+        model.eval()
+        with torch.no_grad():
+            val_scores = model.score(h_val_t, r_val_t, t_val_t).cpu().numpy()
+        val_proba = expit(val_scores)
         vm = compute_metrics(y_val, val_proba)
 
-        if vm["auroc"] > best_loss:
-            best_loss = vm["auroc"]
-            if hasattr(model, "E2"):
-                best_state = {"E1": model.E1.copy(), "E2": model.E2.copy(),
-                              "R1": model.R1.copy(), "R2": model.R2.copy()}
-            else:
-                best_state = {"E": model.E.copy(), "R": model.R.copy()}
+        if vm["auroc"] > best_auroc:
+            best_auroc = vm["auroc"]
+            best_state = {k: v.clone() for k, v in model.state_dict().items()}
 
         if (epoch + 1) % 10 == 0:
             print(f"    Epoch {epoch+1:3d}/{epochs}  "
                   f"loss={epoch_loss/n_batches:.4f}  "
                   f"val_auroc={vm['auroc']:.4f}")
 
-    # Restore best
     if best_state:
-        for k, v in best_state.items():
-            setattr(model, k, v)
+        model.load_state_dict(best_state)
     return model
 
 
@@ -265,6 +263,13 @@ def run_tf_decagon_transductive(se_ids=None, model_name="distmult",
                            h_val, r_val, t_val, y_val,
                            epochs=epochs, batch_size=1024)
 
+    def _score_np(h_np, r_np, t_np):
+        """Score numpy index arrays; returns numpy float32 array."""
+        model.eval()
+        with torch.no_grad():
+            s = model.score(_t(h_np, DEVICE), _t(r_np, DEVICE), _t(t_np, DEVICE))
+        return s.cpu().numpy()
+
     # Evaluate per SE on test edges
     print("\nEvaluating per SE...")
     results_rows = []
@@ -276,18 +281,17 @@ def run_tf_decagon_transductive(se_ids=None, model_name="distmult",
         if mask_test.sum() < 2:
             continue
 
-        # Positive test triples for this SE
         h_pos = h_test[mask_test]
         t_pos = t_test[mask_test]
 
-        # Sample negatives: random tail replacement
+        # Random-tail negatives
         t_neg = rng.integers(0, len(all_drugs), len(h_pos)).astype(np.int32)
         h_all = np.concatenate([h_pos, h_pos])
         r_all = np.full(len(h_all), ri, dtype=np.int32)
         t_all = np.concatenate([t_pos, t_neg])
         y_all = np.array([1]*len(h_pos) + [0]*len(h_pos))
 
-        scores = model.score(h_all, r_all, t_all)
+        scores = _score_np(h_all, r_all, t_all)
         proba  = expit(scores)
         if len(np.unique(y_all)) < 2:
             continue
