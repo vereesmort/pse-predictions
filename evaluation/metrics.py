@@ -92,18 +92,28 @@ class MetricsAggregator:
 
     def _assign_bins(self):
         df = self.se_meta
+        pairs = df["Total Pairs"]
+        miss  = df["Pct Drugs Without Target"]
+
+        # Use data-driven quartile thresholds so bins are always populated,
+        # whether running with 12 representative SEs or all 963.
+        sq = pairs.quantile([0.25, 0.5, 0.75])
+        mq = miss.quantile([0.25, 0.5, 0.75])
+
         def size_bin(p):
-            if p > 6594: return "high"
-            if p > 2970: return "medium"
-            if p > 1231: return "low"
+            if p > sq[0.75]: return "high"
+            if p > sq[0.50]: return "medium"
+            if p > sq[0.25]: return "low"
             return "very_low"
+
         def miss_bin(pct):
-            if pct > 55: return "high"
-            if pct > 41: return "medium"
-            if pct > 34: return "low"
+            if pct > mq[0.75]: return "high"
+            if pct > mq[0.50]: return "medium"
+            if pct > mq[0.25]: return "low"
             return "very_low"
-        df["size_bin"]    = df["Total Pairs"].apply(size_bin)
-        df["missing_bin"] = df["Pct Drugs Without Target"].apply(miss_bin)
+
+        df["size_bin"]    = pairs.apply(size_bin)
+        df["missing_bin"] = miss.apply(miss_bin)
 
     def add(self, results_df: pd.DataFrame):
         """Add a results DataFrame from a model .run() call."""

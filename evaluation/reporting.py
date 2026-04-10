@@ -52,8 +52,8 @@ class Reporter:
         colors  = ["#378ADD", "#1D9E75", "#D85A30", "#7F77DD"]
 
         for i, mode in enumerate(modes):
-            sub = df[df["feature_mode"] == mode].set_index("model")
-            vals = [sub.loc[m, col] if m in sub.index else 0 for m in models]
+            sub = df[df["feature_mode"] == mode].groupby("model")[col].mean()
+            vals = [float(sub.loc[m]) if m in sub.index else 0 for m in models]
             bars = ax.bar(x + i * width - 0.4 + width/2, vals, width,
                           label=mode, color=colors[i % len(colors)], alpha=0.85)
 
