@@ -3,19 +3,29 @@ models/reproductions/nnps_netprop_nmf.py
 =========================================
 NNPS variant: Network Propagation + NMF features (fair protocol).
 
-Replaces PCA with two biologically grounded steps:
+Replaces PCA with three biologically grounded feature blocks fed into NMF:
 
-  1. Random-Walk-with-Restart (RWR) propagates each drug's binary target
-     signal through the PPI network. Gene j receives signal from gene i
-     whenever (i, j) is a PPI edge — capturing guilt-by-association:
-     a drug that targets EGFR also implicitly influences ERBB2 neighbours.
+  1. RWR-propagated target signal  (n_drugs × n_ppi_genes)
+     Random-Walk-with-Restart spreads each drug's protein-target hits
+     through the PPI network — guilt-by-association.
+     Drugs with NO known targets get an all-zero row here.
 
-  2. NMF (Non-negative Matrix Factorization) replaces PCA:
-     - Input is non-negative after propagation → components are additive.
-     - Each latent dimension is an interpretable "biological module":
-       co-active gene neighbourhoods + mono side-effect patterns that
-       load together. Inspect nmf.components_[k] to name each module.
-     - No indefinite sign ambiguity (unlike PCA on binary input).
+  2. Mono side-effect profile  (n_drugs × n_mono_SEs)
+     Binary: known single-drug phenotypic side effects.
+     Complementary to targets; available for most drugs.
+
+  3. Morgan fingerprints + physicochemical descriptors  (n_drugs × 2055)
+     ECFP4 bits (2048) + MW, LogP, HBD, HBA, TPSA, RotBonds, Rings.
+     Derived from SMILES — purely chemical, NO target knowledge required.
+     THIS IS THE KEY FALLBACK FOR TARGET-MISSING DRUGS (~53% of drugs
+     and ~24% of pairs across all SEs have no protein target data).
+
+All three blocks are max-normalised to [0,1] before concatenation so NMF
+treats each block with equal weight (the propagated target values are
+tiny floats vs. binary {0,1} in the other blocks without normalisation).
+
+NMF then learns k latent "biological modules" spanning all three modalities:
+chemical scaffold × PPI neighbourhood × phenotypic side-effect pattern.
 
 All other protocol choices match the fair baseline (nnps_fair.py):
   - NMF fitted on training drugs only (no transductive leakage)
@@ -24,11 +34,33 @@ All other protocol choices match the fair baseline (nnps_fair.py):
   - hadamard_absdiff pair operator
   - LightGBM classifier (or --use-mlp for the paper's MLP)
 
+Dataset context (from per_se_missing_targets.csv)
+--------------------------------------------------
+  ~53% of drugs across all SEs have NO protein target annotation.
+  ~24% of drug pairs have BOTH drugs missing targets.
+  Without fingerprints these pairs have zero RWR signal; with fingerprints
+  the chemical structure still provides a non-zero embedding.
+
+  Representative SE training sizes (positives + 1:1 negatives, 70/10/20):
+    Pulmonary embolism      train~17042  val~2434  test~4869  miss=56%
+    Hyperlipaemia           train~12842  val~1834  test~3669  miss=54%
+    Drug addiction          train~10893  val~1556  test~3112  miss=50%
+    Agranulocytosis         train~ 5990  val~ 855  test~1711  miss=55%
+    Herpes simplex          train~ 6076  val~ 868  test~1736  miss=54%
+    Micturition urgency     train~ 4933  val~ 704  test~1409  miss=50%
+    Meningitis              train~ 3193  val~ 456  test~ 912  miss=56%
+    Superficial thrombo.    train~ 2763  val~ 394  test~ 789  miss=52%
+    External ear infection  train~ 2576  val~ 368  test~ 736  miss=49%
+    Intraocular inflam.     train~ 1201  val~ 171  test~ 343  miss=52%
+    Burns second degree     train~ 1072  val~ 153  test~ 306  miss=46%
+    Viral encephalitis      train~ 1058  val~ 151  test~ 302  miss=55%
+
 Ablation flags
 --------------
   --alpha FLOAT       RWR restart prob (default 0.85; 0 = no propagation)
   --n-components INT  NMF rank (default 128)
   --skip-prop         Skip PPI propagation; NMF on raw binary features only
+  --no-fp             Exclude fingerprints (reverts to target+mono only)
   --random-split      Random pair split instead of cold-start
   --random-neg        Random instead of structured negatives
   --use-mlp           MLP (300→200→100) instead of LightGBM
@@ -37,7 +69,8 @@ Usage
 -----
     python models/reproductions/nnps_netprop_nmf.py
     python models/reproductions/nnps_netprop_nmf.py --ses all
-    python models/reproductions/nnps_netprop_nmf.py --skip-prop
+    python models/reproductions/nnps_netprop_nmf.py --no-fp       # ablate fingerprints
+    python models/reproductions/nnps_netprop_nmf.py --skip-prop   # ablate propagation
     python models/reproductions/nnps_netprop_nmf.py --alpha 0.5
     python models/reproductions/nnps_netprop_nmf.py --n-components 64
     python models/reproductions/nnps_netprop_nmf.py --use-mlp
@@ -60,7 +93,16 @@ from models.reproductions._utils import (
 from models.reproductions.nnps_original import NNPSMlp, train_mlp_per_se
 from features.pair_operators import make_pair_features
 from evaluation.metrics import compute_metrics
-from configs.config import RANDOM_SEED
+from configs.config import RANDOM_SEED, CACHE_DIR
+
+try:
+    from rdkit import Chem
+    from rdkit.Chem import Descriptors, rdMolDescriptors
+    from rdkit.Chem.rdFingerprintGenerator import GetMorganGenerator
+    RDKIT_OK = True
+except ImportError:
+    RDKIT_OK = False
+    print("[nnps_netprop_nmf] RDKit not available — fingerprints disabled.")
 
 
 # ── PPI propagation ────────────────────────────────────────────────────────────
@@ -182,6 +224,90 @@ def build_mono_matrix(mono: pd.DataFrame, drugs: list) -> np.ndarray:
     return X
 
 
+def build_fingerprint_matrix(
+    drugs: list,
+    smiles_cache_path: str,
+    morgan_radius: int = 2,
+    n_bits: int = 2048,
+) -> np.ndarray:
+    """
+    ECFP4 Morgan fingerprints (n_bits) + 7 physicochemical descriptors
+    for each drug in `drugs`. Drugs with no SMILES or unparseable molecules
+    receive an all-zero row — identical fallback to missing-target drugs in
+    X_target. The physchem descriptors are divided by fixed scales so they
+    sit in roughly [0, 1] like the binary fingerprint bits.
+
+    This block is the only non-zero signal for ~53% of drugs that have no
+    protein target annotations. Without it, those drugs are invisible to the
+    NMF regardless of how well the PPI propagation works.
+
+    Returns
+    -------
+    X_fp : (n_drugs, n_bits + 7) float32
+    n_ok : int — number of drugs that have valid SMILES
+    """
+    n_physchem = 7
+    X = np.zeros((len(drugs), n_bits + n_physchem), dtype=np.float32)
+
+    if not RDKIT_OK:
+        print("  [WARNING] RDKit not available — fingerprint block is all-zero.")
+        return X, 0
+
+    smiles_dict: dict = {}
+    if os.path.exists(smiles_cache_path):
+        sc = pd.read_csv(smiles_cache_path)
+        smiles_dict = {r["STITCH"]: r["SMILES"]
+                       for _, r in sc.iterrows() if pd.notna(r["SMILES"])}
+        print(f"  Loaded {len(smiles_dict)} SMILES from cache.")
+    else:
+        print(f"  [WARNING] SMILES cache not found at {smiles_cache_path}.")
+
+    gen = GetMorganGenerator(radius=morgan_radius, fpSize=n_bits)
+    physchem_fns   = [Descriptors.MolWt, Descriptors.MolLogP,
+                      rdMolDescriptors.CalcNumHBD, rdMolDescriptors.CalcNumHBA,
+                      Descriptors.TPSA, rdMolDescriptors.CalcNumRotatableBonds,
+                      rdMolDescriptors.CalcNumRings]
+    physchem_scales = [500.0, 5.0, 10.0, 10.0, 150.0, 10.0, 6.0]
+
+    n_ok = 0
+    for i, drug in enumerate(drugs):
+        smi = smiles_dict.get(drug)
+        if smi is None:
+            continue
+        mol = Chem.MolFromSmiles(str(smi))
+        if mol is None:
+            continue
+        fp = gen.GetFingerprint(mol)
+        X[i, :n_bits] = (
+            np.frombuffer(fp.ToBitString().encode(), dtype=np.uint8) - ord("0")
+        )
+        for j, (fn, scale) in enumerate(zip(physchem_fns, physchem_scales)):
+            try:
+                X[i, n_bits + j] = float(fn(mol)) / scale
+            except Exception:
+                pass
+        n_ok += 1
+
+    n_miss = len(drugs) - n_ok
+    print(f"  Fingerprint matrix : {X.shape}  "
+          f"({n_ok} drugs with SMILES, {n_miss} without → zero rows)")
+    return X, n_ok
+
+
+def max_normalise(X: np.ndarray, name: str) -> np.ndarray:
+    """
+    Scale a feature block to [0, 1] by dividing by its global maximum.
+    Binary matrices (mono, fingerprints) are unchanged (max=1).
+    The RWR-propagated target block has small float values that would
+    otherwise be dominated by the binary blocks in the NMF objective.
+    """
+    m = X.max()
+    if m > 0:
+        return (X / m).astype(np.float32)
+    print(f"  [WARNING] Block '{name}' is all-zero after propagation.")
+    return X
+
+
 def fit_nmf_train_only(
     X_combined: np.ndarray,
     train_idx: np.ndarray,
@@ -217,35 +343,39 @@ def run_netprop_nmf(
     alpha: float = 0.85,
     n_components: int = 128,
     skip_prop: bool = False,
+    use_fp: bool = True,
     random_split: bool = False,
     random_neg: bool = False,
     use_mlp: bool = False,
 ):
-    prop_label = "no_prop" if skip_prop else f"rwr_a{alpha:.2f}"
+    prop_label  = "no_prop" if skip_prop else f"rwr_a{alpha:.2f}"
+    fp_label    = "fp" if use_fp else "nofp"
     split_label = "random_pair" if random_split else "drug_cold_start"
     neg_label   = "random" if random_neg else "structured"
     clf_label   = "mlp" if use_mlp else "lgbm"
-    variant     = f"netprop_nmf_{prop_label}_k{n_components}_{clf_label}"
+    variant     = f"netprop_nmf_{prop_label}_{fp_label}_k{n_components}_{clf_label}"
 
     print("\n" + "=" * 65)
     print("NNPS — Network Propagation + NMF Features (fair protocol)")
-    print(f"  Propagation : {'DISABLED (raw binary)' if skip_prop else f'RWR alpha={alpha}'}")
-    print(f"  Reduction   : NMF (k={n_components})")
-    print(f"  Split       : {split_label}")
-    print(f"  Negatives   : {neg_label}")
-    print(f"  Classifier  : {'MLP (300→200→100)' if use_mlp else 'LightGBM'}")
+    print(f"  Propagation  : {'DISABLED (raw binary)' if skip_prop else f'RWR alpha={alpha}'}")
+    print(f"  Fingerprints : {'YES (ECFP4 + physchem)' if use_fp else 'NO (--no-fp)'}")
+    print(f"  Reduction    : NMF (k={n_components})")
+    print(f"  Split        : {split_label}")
+    print(f"  Negatives    : {neg_label}")
+    print(f"  Classifier   : {'MLP (300→200→100)' if use_mlp else 'LightGBM'}")
     print("=" * 65 + "\n")
 
     combo_f, mono, ppi, targets, all_drugs, se_ids = load_decagon_data(se_ids)
     d2i = {d: i for i, d in enumerate(all_drugs)}
 
-    # ── Step 1: build raw drug-protein and drug-mono matrices ─────────────────
+    # ── Step 1: build raw feature matrices ────────────────────────────────────
     print("Building feature matrices...")
     X_target, all_genes = build_target_matrix(targets, ppi, all_drugs)
     X_mono = build_mono_matrix(mono, all_drugs)
-    print(f"  Target matrix : {X_target.shape}  "
-          f"(density={X_target.mean():.4f})")
-    print(f"  Mono   matrix : {X_mono.shape}  "
+    n_no_target = int((X_target.sum(axis=1) == 0).sum())
+    print(f"  Target matrix  : {X_target.shape}  "
+          f"({n_no_target}/{len(all_drugs)} drugs have no targets → zero rows)")
+    print(f"  Mono   matrix  : {X_mono.shape}  "
           f"(density={X_mono.mean():.4f})")
 
     # ── Step 2: PPI propagation ────────────────────────────────────────────────
@@ -255,22 +385,41 @@ def run_netprop_nmf(
     else:
         W_sym, _ = build_symmetric_adjacency(ppi, all_genes)
         X_propagated = random_walk_restart(X_target, W_sym, alpha=alpha)
-        print(f"  Propagated target matrix: {X_propagated.shape}  "
-              f"(mean={X_propagated.mean():.4f}, "
-              f"max={X_propagated.max():.4f})")
+        print(f"  Propagated     : {X_propagated.shape}  "
+              f"(mean={X_propagated.mean():.5f}, max={X_propagated.max():.4f})")
 
-    # ── Step 3: combine propagated targets + mono SEs ─────────────────────────
-    # Mono SEs are already biologically meaningful binary features;
-    # we concatenate them with the propagated gene scores before NMF
-    # so the model can learn cross-modal latent modules.
-    X_combined = np.concatenate([X_propagated, X_mono], axis=1)
-    print(f"  Combined matrix : {X_combined.shape}")
+    # ── Step 3: Morgan fingerprints ───────────────────────────────────────────
+    # Drugs with no protein targets have all-zero rows in X_propagated.
+    # Fingerprints provide non-zero signal for those drugs via chemical
+    # structure alone, covering ~53% of drugs and ~24% of pairs.
+    if use_fp:
+        smiles_cache = os.path.join(CACHE_DIR, "smiles.csv")
+        X_fp, _ = build_fingerprint_matrix(all_drugs, smiles_cache)
+    else:
+        X_fp = None
 
-    # ── Step 4: negatives & splits ────────────────────────────────────────────
+    # ── Step 4: normalise and concatenate all blocks ──────────────────────────
+    # Max-normalise each block to [0, 1] so that the RWR propagated values
+    # (small floats) are on the same scale as the binary {0,1} blocks.
+    # Binary matrices are unchanged by this operation (their max = 1).
+    blocks = [
+        max_normalise(X_propagated, "propagated_target"),
+        max_normalise(X_mono,       "mono_se"),
+    ]
+    block_desc = "rwr_target+mono"
+    if X_fp is not None:
+        blocks.append(max_normalise(X_fp, "fingerprints"))
+        block_desc += "+fp"
+
+    X_combined = np.concatenate(blocks, axis=1)
+    print(f"  Combined matrix : {X_combined.shape}  "
+          f"(blocks: {block_desc})")
+
+    # ── Step 5: negatives & splits ────────────────────────────────────────────
     negatives = build_negatives(combo_f, neg_label, se_ids)
     splits    = build_splits(combo_f, negatives, split_label, se_ids)
 
-    # ── Step 5: per-SE NMF + classifier ───────────────────────────────────────
+    # ── Step 6: per-SE NMF + classifier ───────────────────────────────────────
     lgbm_params = {
         "learning_rate"    : 0.05,
         "num_leaves"       : 63,
@@ -343,7 +492,7 @@ def run_netprop_nmf(
             "split"       : split_label,
             "neg"         : neg_label,
             "operator"    : "hadamard_absdiff",
-            "features"    : f"{'rwr' if not skip_prop else 'raw'}_target+mono_nmf{actual_k}d",
+            "features"    : f"{block_desc}_nmf{actual_k}d",
             "alpha"       : alpha if not skip_prop else 0.0,
             "n_components": actual_k,
             **metrics,
@@ -375,6 +524,8 @@ if __name__ == "__main__":
                         help="NMF rank / number of latent biological modules (default: 128)")
     parser.add_argument("--skip-prop", action="store_true",
                         help="Skip PPI propagation; apply NMF to raw binary features")
+    parser.add_argument("--no-fp", action="store_true",
+                        help="Exclude Morgan fingerprints (ablate the chemical block)")
     parser.add_argument("--random-split", action="store_true",
                         help="Use random pair split instead of cold-start (introduces leakage)")
     parser.add_argument("--random-neg", action="store_true",
@@ -389,6 +540,7 @@ if __name__ == "__main__":
         alpha=args.alpha,
         n_components=args.n_components,
         skip_prop=args.skip_prop,
+        use_fp=not args.no_fp,
         random_split=args.random_split,
         random_neg=args.random_neg,
         use_mlp=args.use_mlp,
